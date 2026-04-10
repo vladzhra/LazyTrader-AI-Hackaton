@@ -68,9 +68,88 @@ def reset_wallet():
         "portfolio_history": [
             {"timestamp": datetime.now(timezone.utc).isoformat(), "value": INITIAL_USD}
         ],
+        "seeded": False,
     }
     save_wallet(wallet)
     return wallet
+
+
+def seed_portfolio_history(wallet):
+    """
+    Pre-populate portfolio_history with 7 days of simulated trading on real
+    BTC + ETH hourly prices (momentum strategy, no AI needed).
+    This makes the performance chart look alive from the very first load.
+    """
+    try:
+        # Hourly prices for the last 7 days (~168 points each)
+        btc_h = get_historical_prices("bitcoin", 7)
+        eth_h = get_historical_prices("ethereum", 7)
+        if not btc_h or not eth_h or len(btc_h) < 10:
+            return wallet
+
+        n = min(len(btc_h), len(eth_h))
+        sim = {"usd": INITIAL_USD, "btc": 0.0, "eth": 0.0}
+        history = []
+        trades = []
+
+        for i in range(n):
+            ts_ms, bp = btc_h[i]
+            ep = eth_h[i][1]
+            ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+
+            if i >= 3:
+                # Simple momentum: compare current price to 3 periods ago
+                bp_prev = btc_h[i - 3][1]
+                ep_prev = eth_h[i - 3][1]
+                btc_mom = (bp - bp_prev) / bp_prev * 100
+                eth_mom = (ep - ep_prev) / ep_prev * 100
+
+                if btc_mom > 0.4 and sim["usd"] > 200:
+                    spend = sim["usd"] * 0.5
+                    bought = spend / bp
+                    sim["usd"] -= spend
+                    sim["btc"] += bought
+                    trades.append({"timestamp": ts, "action": "BUY", "coin": "BTC",
+                                   "amount": bought, "price": bp, "usd_value": spend})
+
+                elif eth_mom > 0.5 and sim["usd"] > 200:
+                    spend = sim["usd"] * 0.4
+                    bought = spend / ep
+                    sim["usd"] -= spend
+                    sim["eth"] += bought
+                    trades.append({"timestamp": ts, "action": "BUY", "coin": "ETH",
+                                   "amount": bought, "price": ep, "usd_value": spend})
+
+                elif btc_mom < -0.5 and sim["btc"] > 0:
+                    sold = sim["btc"] * 0.5
+                    gained = sold * bp
+                    sim["btc"] -= sold
+                    sim["usd"] += gained
+                    trades.append({"timestamp": ts, "action": "SELL", "coin": "BTC",
+                                   "amount": sold, "price": bp, "usd_value": gained})
+
+                elif eth_mom < -0.6 and sim["eth"] > 0:
+                    sold = sim["eth"] * 0.5
+                    gained = sold * ep
+                    sim["eth"] -= sold
+                    sim["usd"] += gained
+                    trades.append({"timestamp": ts, "action": "SELL", "coin": "ETH",
+                                   "amount": sold, "price": ep, "usd_value": gained})
+
+            total = sim["usd"] + sim["btc"] * bp + sim["eth"] * ep
+            history.append({"timestamp": ts, "value": total})
+
+        # Carry over the simulated state into the real wallet
+        wallet["usd"] = sim["usd"]
+        wallet["btc"] = sim["btc"]
+        wallet["eth"] = sim["eth"]
+        wallet["portfolio_history"] = history
+        wallet["trade_history"] = trades
+        wallet["seeded"] = True
+        return wallet
+    except Exception:
+        wallet["seeded"] = True  # Don't retry on error
+        return wallet
 
 
 # ─── Market Data ─────────────────────────────────────────────────────────────
@@ -110,32 +189,68 @@ def get_historical_prices(coin="bitcoin", days=30):
 
 # ─── Gemini ───────────────────────────────────────────────────────────────────
 
+def _list_gemini_models():
+    """Return available generateContent model names from the API."""
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        names = []
+        for m in data.get("models", []):
+            name = m.get("name", "")  # e.g. "models/gemini-1.5-flash"
+            supported = m.get("supportedGenerationMethods", [])
+            if "generateContent" in supported and name.startswith("models/"):
+                names.append(name.replace("models/", ""))
+        return names
+    except Exception:
+        return []
+
+
 def call_gemini(prompt):
     if API_KEY == "YOUR_API_KEY_HERE":
         return None, "GEMINI_API_KEY not set"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    # Preferred models in order; fall back to whatever the API reports
+    preferred = [
+        "gemini-2.5-flash-preview-04-17",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-001",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-1.0-pro",
+    ]
+    # Append any models returned by the API that aren't already in the list
+    for m in _list_gemini_models():
+        if m not in preferred and "flash" in m.lower():
+            preferred.append(m)
+
     last_err = None
-    for model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-        endpoint = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={API_KEY}"
-        )
-        req = Request(
-            endpoint,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urlopen(req, timeout=30) as r:
-                resp = json.loads(r.read().decode())
-            candidates = resp.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts and "text" in parts[0]:
-                    return parts[0]["text"].strip(), None
-        except Exception as e:
-            last_err = e
+    for model in preferred:
+        for api_version in ("v1beta", "v1"):
+            endpoint = (
+                f"https://generativelanguage.googleapis.com/{api_version}/models/"
+                f"{model}:generateContent?key={API_KEY}"
+            )
+            req = Request(
+                endpoint,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urlopen(req, timeout=30) as r:
+                    resp = json.loads(r.read().decode())
+                candidates = resp.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts and "text" in parts[0]:
+                        return parts[0]["text"].strip(), None
+            except Exception as e:
+                last_err = e
+                break  # 404/403 on this model → try next model
     return None, str(last_err)
 
 
@@ -183,7 +298,7 @@ def execute_trade(action, btc_price, eth_price, wallet):
     result = "HOLD — no transaction."
 
     if action == "BUY_BTC" and wallet["usd"] > 100:
-        spend = wallet["usd"] * 0.25
+        spend = wallet["usd"] * 0.50
         bought = spend / btc_price
         wallet["usd"] -= spend
         wallet["btc"] += bought
@@ -191,7 +306,7 @@ def execute_trade(action, btc_price, eth_price, wallet):
         trade_log = {"action": "BUY", "coin": "BTC", "amount": bought, "price": btc_price, "usd_value": spend}
 
     elif action == "BUY_ETH" and wallet["usd"] > 100:
-        spend = wallet["usd"] * 0.25
+        spend = wallet["usd"] * 0.50
         bought = spend / eth_price
         wallet["usd"] -= spend
         wallet["eth"] += bought
@@ -199,7 +314,7 @@ def execute_trade(action, btc_price, eth_price, wallet):
         trade_log = {"action": "BUY", "coin": "ETH", "amount": bought, "price": eth_price, "usd_value": spend}
 
     elif action == "SELL_BTC" and wallet["btc"] > 0:
-        sold = wallet["btc"] * 0.4
+        sold = wallet["btc"] * 0.60
         gained = sold * btc_price
         wallet["btc"] -= sold
         wallet["usd"] += gained
@@ -207,7 +322,7 @@ def execute_trade(action, btc_price, eth_price, wallet):
         trade_log = {"action": "SELL", "coin": "BTC", "amount": sold, "price": btc_price, "usd_value": gained}
 
     elif action == "SELL_ETH" and wallet["eth"] > 0:
-        sold = wallet["eth"] * 0.4
+        sold = wallet["eth"] * 0.60
         gained = sold * eth_price
         wallet["eth"] -= sold
         wallet["usd"] += gained
@@ -323,6 +438,12 @@ def main():
 
     wallet = load_wallet()
 
+    # Seed history on first ever load (fills the chart with 7 days of real data)
+    if not wallet.get("seeded", False):
+        with st.spinner("📊 Preparing portfolio with 7 days of real market history…"):
+            wallet = seed_portfolio_history(wallet)
+            save_wallet(wallet)
+
     # Cache market data for 60 s
     now = time.time()
     if "mkt" not in st.session_state or now - st.session_state.get("mkt_t", 0) > 60:
@@ -348,15 +469,7 @@ def main():
 
     st.divider()
 
-    # ── Portfolio chart ──
-    hist = wallet.get("portfolio_history", [])
-    if len(hist) > 1:
-        df_h = pd.DataFrame(hist)
-        df_h["timestamp"] = pd.to_datetime(df_h["timestamp"])
-        df_h = df_h.set_index("timestamp")
-        st.subheader("📈 Portfolio Performance")
-        st.area_chart(df_h["value"], height=180)
-        st.divider()
+
 
     # ── Two-column layout ──
     left, right = st.columns([1, 1], gap="large")
@@ -364,69 +477,87 @@ def main():
     with left:
         st.subheader("🤖 AI Trading Engine")
 
-        magic = st.button("⚡ MAGIC AUTO-TRADE  (3 rounds)", use_container_width=True, type="primary")
+        # ── Auto-trade toggle ──
+        auto_on = st.toggle(
+            "🔄 Auto-Trade Mode — Gemini trades every 60 seconds",
+            value=st.session_state.get("auto_on", False),
+        )
+        st.session_state.auto_on = auto_on
+
         c1, c2 = st.columns(2)
-        single = c1.button("🎯 Single Trade", use_container_width=True)
+        single = c1.button("⚡ Trade Now", use_container_width=True, type="primary")
         reset = c2.button("🔄 Reset Portfolio", use_container_width=True)
 
         if reset:
             wallet = reset_wallet()
             st.session_state.pop("mkt", None)
+            st.session_state.pop("last_auto_t", None)
             st.success("Portfolio reset to $10,000!")
             time.sleep(0.8)
             st.rerun()
 
         status = st.empty()
-        advice_box = st.empty()
-        result_box = st.empty()
 
-        if magic or single:
-            rounds = 3 if magic else 1
-            summaries = []
+        # Persistent last-trade result (survives reruns)
+        if st.session_state.get("last_trade_msg"):
+            st.success(st.session_state.last_trade_msg)
 
-            for i in range(rounds):
-                pfx = f"Round {i+1}/{rounds} — " if rounds > 1 else ""
+        # ── Auto-trade logic: fires every 60 s while toggle is ON ──
+        if auto_on:
+            last_t = st.session_state.get("last_auto_t", 0)
+            elapsed = time.time() - last_t
+            remaining = max(0, 60 - elapsed)
 
-                status.info(f"{pfx}📡 Fetching live prices…")
+            if elapsed >= 60 or last_t == 0:
+                status.info("🤖 Auto-trade triggered — asking Gemini…")
                 btc_price, btc_chg, eth_price, eth_chg = get_market_data()
                 st.session_state.mkt = (btc_price, btc_chg, eth_price, eth_chg)
 
-                status.info(f"{pfx}🧠 Gemini is analyzing the market…")
                 raw = get_trading_advice(btc_price, btc_chg, eth_price, eth_chg, wallet)
                 action, conf, reason = parse_advice(raw)
-
                 conf_dot = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(conf, "⚪")
-                advice_box.success(
-                    f"**AI Decision:** `{action}` {conf_dot} {conf} confidence\n\n_{reason}_"
-                )
 
                 trade_msg, new_total = execute_trade(action, btc_price, eth_price, wallet)
                 save_wallet(wallet)
+                st.session_state.last_auto_t = time.time()
 
                 cur_pnl = new_total - init
                 cur_pct = cur_pnl / init * 100
                 sign = "+" if cur_pnl >= 0 else ""
-                status.success(
-                    f"✅ {pfx}Executed! Portfolio: **${new_total:,.2f}** "
-                    f"({sign}{cur_pct:.2f}% from start)"
+                st.session_state.last_trade_msg = (
+                    f"**AI:** `{action}` {conf_dot} {conf} — _{reason}_\n\n"
+                    f"✅ {trade_msg} · Portfolio: **${new_total:,.2f}** ({sign}{cur_pct:.2f}%)"
                 )
-                summaries.append(f"Round {i+1}: **{action}** → {trade_msg}")
-
-                if i < rounds - 1:
-                    time.sleep(1.2)
-
-            final = wallet["usd"] + wallet["btc"] * btc_price + wallet["eth"] * eth_price
-            final_pnl = final - init
-
-            if rounds > 1:
-                result_box.info("\n\n".join(summaries))
-                if final_pnl >= 0:
+                if cur_pnl >= 0:
                     st.balloons()
-                    st.success(f"🎉 Session done! Portfolio: **${final:,.2f}** (+${final_pnl:,.2f})")
-                else:
-                    st.warning(f"Session done. Portfolio: **${final:,.2f}** (${final_pnl:,.2f})")
+                st.rerun()
+            else:
+                status.info(f"⏱ Next AI trade in **{remaining:.0f}s** · Auto-Trade ON")
+                time.sleep(1)
+                st.rerun()
 
-            time.sleep(1)
+        # ── Manual single trade ──
+        elif single:
+            status.info("🧠 Gemini is analyzing…")
+            btc_price, btc_chg, eth_price, eth_chg = get_market_data()
+            st.session_state.mkt = (btc_price, btc_chg, eth_price, eth_chg)
+
+            raw = get_trading_advice(btc_price, btc_chg, eth_price, eth_chg, wallet)
+            action, conf, reason = parse_advice(raw)
+            conf_dot = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(conf, "⚪")
+
+            trade_msg, new_total = execute_trade(action, btc_price, eth_price, wallet)
+            save_wallet(wallet)
+
+            cur_pnl = new_total - init
+            cur_pct = cur_pnl / init * 100
+            sign = "+" if cur_pnl >= 0 else ""
+            st.session_state.last_trade_msg = (
+                f"**AI:** `{action}` {conf_dot} {conf} — _{reason}_\n\n"
+                f"✅ {trade_msg} · Portfolio: **${new_total:,.2f}** ({sign}{cur_pct:.2f}%)"
+            )
+            if cur_pnl >= 0:
+                st.balloons()
             st.rerun()
 
     with right:
