@@ -82,8 +82,8 @@ def seed_portfolio_history(wallet):
     """
     try:
         # Hourly prices for the last 7 days (~168 points each)
-        btc_h = get_historical_prices("bitcoin", 7)
-        eth_h = get_historical_prices("ethereum", 7)
+        btc_h, _ = get_historical_prices("bitcoin", 7)
+        eth_h, _ = get_historical_prices("ethereum", 7)
         if not btc_h or not eth_h or len(btc_h) < 10:
             return wallet
 
@@ -174,17 +174,25 @@ def get_market_data():
 
 
 def get_historical_prices(coin="bitcoin", days=30):
-    try:
-        url = (
-            f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart"
-            f"?vs_currency=usd&days={days}&interval=daily"
-        )
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode())
-        return [(p[0], p[1]) for p in data["prices"]]
-    except Exception:
-        return []
+    """Returns (prices_list, error_str). On success error_str is None."""
+    url = (
+        f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart"
+        f"?vs_currency=usd&days={days}&interval=daily"
+    )
+    last_err = None
+    for attempt in range(3):
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode())
+            return [(p[0], p[1]) for p in data["prices"]], None
+        except Exception as e:
+            last_err = str(e)
+            if "429" in last_err or "Too Many" in last_err:
+                time.sleep(2 * (attempt + 1))
+                continue
+            return [], last_err
+    return [], f"Rate limited by CoinGecko: {last_err}"
 
 
 # ─── Gemini ───────────────────────────────────────────────────────────────────
@@ -438,11 +446,14 @@ def main():
 
     wallet = load_wallet()
 
-    # Seed history on first ever load (fills the chart with 7 days of real data)
-    if not wallet.get("seeded", False):
+    # Seed history only once per session (never blocks subsequent interactions)
+    if not st.session_state.get("seeded_done") and not wallet.get("seeded", False):
+        st.session_state.seeded_done = True
         with st.spinner("📊 Preparing portfolio with 7 days of real market history…"):
             wallet = seed_portfolio_history(wallet)
             save_wallet(wallet)
+    else:
+        st.session_state.seeded_done = True
 
     # Cache market data for 60 s
     now = time.time()
@@ -586,11 +597,12 @@ def main():
 
     if st.button("🚀 Run AI Backtest (30 days)", use_container_width=True):
         with st.spinner("Fetching 30 days of BTC + ETH price history from CoinGecko…"):
-            btc_h = get_historical_prices("bitcoin", 30)
-            eth_h = get_historical_prices("ethereum", 30)
+            btc_h, btc_err = get_historical_prices("bitcoin", 30)
+            eth_h, eth_err = get_historical_prices("ethereum", 30)
 
+        fetch_err = btc_err or eth_err
         if not btc_h or not eth_h:
-            st.error("Could not fetch historical data. Check your connection.")
+            st.error(f"Could not fetch historical data: {fetch_err}")
         else:
             with st.spinner("🧠 Gemini is analyzing 30 days of data — this takes ~10 seconds…"):
                 result, err = run_backtest(btc_h, eth_h)
